@@ -1,9 +1,8 @@
 [project]
-name = "kb"
+name = "brain"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
 dependencies = [
     "docling>=2.110.0",
     "httpx>=0.28.1",
@@ -22,3 +21,6 @@ dependencies = [
     "scikit-learn>=1.9.0",
     "textual>=8.2.7",
 ]
+
+[project.scripts]
+expand = "brain.cli.expand:main"
