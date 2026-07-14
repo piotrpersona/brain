@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 import os
 import uuid
@@ -8,67 +9,86 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Official Google GenAI SDK
+from google import genai
+from google.genai import types
+
 # RAG-Anything imports
 from raganything import RAGAnything, RAGAnythingConfig
 from lightrag.utils import EmbeddingFunc
-from lightrag.llm.openai import openai_complete_if_cache
 
-# Unified Configuration Variables
-MODEL_API_HOST = os.getenv("MODEL_API_HOST", "https://openrouter.ai/api/v1") 
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen/qwen3-14b")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen/qwen3-embedding-8b")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
-MODEL_API_KEY = os.getenv("MODEL_API_KEY", "your_api_key_here")
+# Unified Configuration Variables for Gemini
+# Note: GEMINI_API_KEY will be automatically picked up by genai.Client() if set in env
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-2")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "2072")) # Gemini default is 768
 
-# Normalize base URL (strip trailing slashes, handle missing /v1 if needed)
-MODEL_API_BASE_URL = MODEL_API_HOST.rstrip("/")
+# Initialize the Gemini Client
+client = genai.Client()
 
-
-async def generic_llm_model_func(
+async def gemini_llm_model_func(
     prompt: str,
     system_prompt: Optional[str] = None,
     history_messages: List[Dict] = None,
     **kwargs,
 ) -> str:
-    """Universal OpenAI-compatible LLM function."""
-    return await openai_complete_if_cache(
-        model=LLM_MODEL,
-        prompt=prompt,
-        system_prompt=system_prompt,
-        history_messages=history_messages or [],
-        base_url=MODEL_API_BASE_URL,
-        api_key=MODEL_API_KEY,
-        **kwargs,
+    """Native Gemini LLM implementation mapping OpenAI-style history formats."""
+    # Convert system prompt to Gemini's GenerateContentConfig format if present
+    config = types.GenerateContentConfig()
+    if system_prompt:
+        config.system_instruction = system_prompt
+        
+    # Map extra parameters (like temperature) if passed in kwargs
+    if "temperature" in kwargs:
+        config.temperature = kwargs["temperature"]
+
+    # If there's an existing chat history, we map it to Gemini's types.Content structure
+    if history_messages:
+        contents = []
+        for msg in history_messages:
+            role = "user" if msg.get("role") == "user" else "model"
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=msg.get("content", ""))]
+                )
+            )
+        # Append the final prompt as the latest turn
+        contents.append(
+            types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        )
+        
+        # We use standard client.aio for async API calls
+        response = await client.aio.models.generate_content(
+            model=LLM_MODEL,
+            contents=contents,
+            config=config
+        )
+    else:
+        # Simple standalone prompt execution
+        response = await client.aio.models.generate_content(
+            model=LLM_MODEL,
+            contents=prompt,
+            config=config
+        )
+        
+    return response.text
+
+
+async def gemini_embedding_async(texts: List[str]) -> List[List[float]]:
+    """Native Gemini async embedding function."""
+    response = await client.aio.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=texts,
+        # Gemini allows configuring specific dimensions if needed via config:
+        # config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIM)
     )
+    # Extract out the floating point lists from the response object
+    return [embedding.values for embedding in response.embeddings]
 
 
-async def generic_embedding_async(texts: List[str]) -> List[List[float]]:
-    """Universal OpenAI-compatible embedding function using httpx."""
-    headers = {
-        "Authorization": f"Base {MODEL_API_KEY}" if "Bearer " in MODEL_API_KEY else f"Bearer {MODEL_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    # OpenRouter tracking headers (Optional)
-    if "openrouter.ai" in MODEL_API_BASE_URL:
-        headers["HTTP-Referer"] = "https://localhost:3000"
-        headers["X-Title"] = "RAG-Anything"
-
-    payload = {
-        "model": EMBEDDING_MODEL,
-        "input": texts
-    }
-    
-    async with httpx.AsyncClient() as client:
-        # Construct path carefully depending on if /v1 is already in the host
-        url = f"{MODEL_API_BASE_URL}/embeddings"
-        response = await client.post(url, json=payload, headers=headers, timeout=60.0)
-        response.raise_for_status()
-        data = response.json()
-        return [item["embedding"] for item in data["data"]]
-
-
-class GenericRAGIntegration:
-    """Universal Integration class for RAG-Anything."""
+class GeminiRAGIntegration:
+    """Integration class for RAG-Anything powered by Gemini."""
 
     def __init__(self):
         self.llm_model = LLM_MODEL
@@ -76,7 +96,7 @@ class GenericRAGIntegration:
         self.embedding_dim = EMBEDDING_DIM
 
         self.config = RAGAnythingConfig(
-            working_dir=f"./data/rag_storage_generic/{uuid.uuid4()}",
+            working_dir=f"./data/rag_storage_gemini/{uuid.uuid4()}",
             parser="docling",
             parse_method="auto",
             enable_image_processing=False,
@@ -87,14 +107,15 @@ class GenericRAGIntegration:
         self.rag = None
 
     async def test_embedding(self) -> bool:
-        """Sanity-check for the embedding endpoint."""
+        """Sanity-check for the Gemini embedding endpoint."""
         try:
             print(f"🔢 Testing embedding model: {self.embedding_model}")
-            vectors = await generic_embedding_async(["hello world"])
+            vectors = await gemini_embedding_async(["hello world"])
             if vectors and len(vectors[0]) > 0:
-                print(f"✅ Embedding OK — dim={len(vectors[0])} (configured: {self.embedding_dim})")
-                if len(vectors[0]) != self.embedding_dim:
-                    print(f"  ⚠️ Dimension mismatch! Got {len(vectors[0])}, configured {self.embedding_dim}")
+                actual_dim = len(vectors[0])
+                print(f"✅ Embedding OK — dim={actual_dim} (configured: {self.embedding_dim})")
+                if actual_dim != self.embedding_dim:
+                    print(f"  ⚠️ Dimension mismatch! Got {actual_dim}, configured {self.embedding_dim}")
                 return True
             print("❌ Embedding returned empty vector")
             return False
@@ -103,10 +124,10 @@ class GenericRAGIntegration:
             return False
 
     async def test_chat(self) -> bool:
-        """Sanity-check for the LLM endpoint."""
+        """Sanity-check for the Gemini LLM endpoint."""
         try:
             print(f"💬 Testing LLM model: {self.llm_model}")
-            result = await generic_llm_model_func("Say 'OK' in one word.")
+            result = await gemini_llm_model_func("Say 'OK' in one word.")
             print(f"✅ Chat OK — response: {result.strip()[:80]}")
             return True
         except Exception as e:
@@ -116,17 +137,17 @@ class GenericRAGIntegration:
     def _make_embedding_func(self) -> EmbeddingFunc:
         return EmbeddingFunc(
             embedding_dim=self.embedding_dim,
-            max_token_size=8192,
-            func=generic_embedding_async,
+            max_token_size=2048, # Gemini embeddings support up to 2048 tokens per segment
+            func=gemini_embedding_async,
         )
 
     async def initialize_rag(self) -> bool:
-        """Initialize RAG-Anything."""
-        print("\nInitializing RAG-Anything ...")
+        """Initialize RAG-Anything with Gemini endpoints."""
+        print("\nInitializing RAG-Anything with Gemini...")
         try:
             self.rag = RAGAnything(
                 config=self.config,
-                llm_model_func=generic_llm_model_func,
+                llm_model_func=gemini_llm_model_func,
                 embedding_func=self._make_embedding_func(),
             )
             print("✅ RAG-Anything initialized")
@@ -143,8 +164,8 @@ class GenericRAGIntegration:
         document_path = document_uri
         if document_uri.startswith("http"):
             print(f"⬇️ Fetching document: {document_path[:120]}")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(document_uri)
+            async with httpx.AsyncClient() as client_http:
+                response = await client_http.get(document_uri)
                 document_content = response.content
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
                 temp_pdf.write(document_content)
@@ -153,7 +174,7 @@ class GenericRAGIntegration:
             print(f"📄 Processing: {document_path}")
             await self.rag.process_document_complete(
                 file_path=document_path,
-                output_dir="./output_generic",
+                output_dir="./output_gemini",
                 parse_method="auto",
                 display_stats=True,
             )
@@ -174,10 +195,15 @@ class GenericRAGIntegration:
 
 async def main():
     print("=" * 70)
-    print("Generic API + RAG-Anything Integration")
+    print("Google Gemini API + RAG-Anything Integration")
     print("=" * 70)
 
-    integration = GenericRAGIntegration()
+    # Ensure your GEMINI_API_KEY is available in your environment before executing
+    if not os.getenv("GEMINI_API_KEY"):
+        print("❌ Error: GEMINI_API_KEY environment variable not set.")
+        return False
+
+    integration = GeminiRAGIntegration()
 
     if not await integration.test_embedding():
         return False
